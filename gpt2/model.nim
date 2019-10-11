@@ -40,10 +40,8 @@ func newGPT2Model(model_path: string, hparams: HParams): GPT2ModelRef =
 
 func scope(self: GPT2ModelRef, scope: string): GPT2ModelRef =
   new result
+  result[] = self[]
   result.current_scope = self.current_scope & "/" & scope
-  result.model_path = self.model_path
-  result.hparams = self.hparams
-  result.cache = self.cache
 
 proc get_tensor[T](self: GPT2ModelRef, name: string): Tensor[T] =
   let filename = (self.current_scope & "/" & name).replace("/", "_") & ":0.npy"
@@ -75,6 +73,9 @@ func fix_shape(x: Tensor, shape: openarray[int]): seq[int] =
       result.add(x_product div shape_product)
     else:
       result.add(n)
+
+func np_reshape(x: Tensor, shape: varargs[int]): Tensor =
+  x.reshape(x.fix_shape(shape))
 
 func range_tensor(l, h: int): Tensor[int] =
   (l ..< h).toSeq().toTensor()
@@ -128,7 +129,7 @@ proc conv1d(x, w, b: Tensor): Tensor =
   let start = x.shape[0 ..< ^1].toSeq()
   let nx = x.shape[^1]
   let shape = start.concat(@[nf])
-  let t0 = (reshape(x, fix_shape(x, [-1, nx])) * reshape(w, fix_shape(w, [-1, nf])))
+  let t0 = x.np_reshape(-1, nx) * w.np_reshape(-1, nf)
   reshape(t0 .+ b, shape)
 
 func attention_mask[T](nd, ns: int): Tensor[T] =
@@ -175,8 +176,8 @@ proc matmul[T](a, b: Tensor[T]): Tensor[T] =
 
   assert start_a.len == 0 or start_b.len == 0 or start_a == start_b
 
-  let flat_a = a.reshape(a.fix_shape([-1, a.shape[^2], a.shape[^1]]))
-  let flat_b = b.reshape(b.fix_shape([-1, b.shape[^2], b.shape[^1]]))
+  let flat_a = a.np_reshape(-1, a.shape[^2], a.shape[^1])
+  let flat_b = b.np_reshape(-1, b.shape[^2], b.shape[^1])
 
   var result_seq = newSeq[Tensor[T]]()
   for i in 0 ..< max(flat_a.shape[0], flat_b.shape[0]):
@@ -221,8 +222,8 @@ proc attn(self: GPT2ModelRef, x: Tensor, n_state: int, past: Option[Tensor]): tu
   let present = stack([k, v], axis=1)
   if past.isSome:
     let pkv = past.get.split(1, axis=1)
-    let pk = pkv[0]
-    let pv = pkv[1]
+    let pk = pkv[0].squeeze(1)
+    let pv = pkv[1].squeeze(1)
     k = concat([pk, k], axis= -2 of k)
     v = concat([pv, v], axis= -2 of v)
   var a = multihead_attn(q, k, v)
@@ -251,7 +252,7 @@ proc layer[T](self: GPT2ModelRef, x: Tensor[T], past: Option[Tensor[T]]): tuple[
 
 func gather[T](x: Tensor[T], indices: Tensor[int]): Tensor[T] =
   var flat_tensors: seq[Tensor[T]] = @[]
-  let flat_indices = indices.reshape(indices.fix_shape([-1]))
+  let flat_indices = indices.np_reshape(-1)
   for i in 0 ..< flat_indices.shape[0]:
     flat_tensors.add(x.nth_or_first(i))
   let shape = indices.shape.toSeq.concat(x.shape[1 .. ^1].toSeq)
@@ -289,7 +290,7 @@ proc predict[T](self: GPT2ModelRef, x: Tensor[int], past: Option[Tensor[T]]): tu
         if past.isNone:
           none(Tensor[T])
         else:
-          some(past.get.nth_or_first(i))
+          some(past.get[_, i].squeeze(1))
       let r = self.scope(&"h{i}").layer(h, past=p)
       h = r.a
       presents.add(r.p)
@@ -348,7 +349,7 @@ when isMainModule:
       ]].toTensor()
       let b = [[1, 1]].toTensor()
       check conv1d(x, w, b) == [35, 41].toTensor()
-    
+
     test "fix_shape":
       let x = range_tensor(8)
       check x.fix_shape([-1, 2]) == @[4, 2]
@@ -370,7 +371,7 @@ when isMainModule:
       let mw = mask_attn_weights(w)
       check mw[0, 0, 0, _].reshape([4]) == [0, 1, -int(1e10), -int(1e10)].toTensor()
       check mw[0, 0, 1, _].reshape([4]) == [4, 5, 6, -int(1e10)].toTensor()
-    
+
     test "multihead_attn":
       let (b, h, s, f) = (1, 2, 3, 4)
       let q = range_tensor(b*h*s*f).reshape([b, h, s, f]).astype(float32)
@@ -388,6 +389,7 @@ when isMainModule:
       let x = range_tensor(12).reshape(2, 6)
       let past = none(Tensor[float32])
       let r =  self.predict(x, past)
+      let r2 =  self.predict(x, some(r.present))
       check r.logits[0, 0, 0..<10].reshape([10]) == [
         float32 -37.75491333007812, -38.26512145996094, -40.4859504699707, -40.55413055419922, -39.97011947631836,
         -40.66231155395508, -38.56421279907227, -39.10071563720703, -38.16803359985352, -39.44895935058594
@@ -399,4 +401,4 @@ when isMainModule:
 
   addHandler(newConsoleLogger())
   runTests()
-  
+
